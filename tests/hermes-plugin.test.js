@@ -32,7 +32,13 @@ function pythonExe() {
 function python(script, env = {}) {
   const result = spawnSync(pythonExe(), ['-c', script], {
     cwd: root,
-    env: { ...process.env, ...env },
+    // Isolate from the developer's own ~/.config/ponytail and PONYTAIL_DEFAULT_MODE.
+    env: {
+      ...process.env,
+      PONYTAIL_DEFAULT_MODE: '',
+      XDG_CONFIG_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-config-')),
+      ...env,
+    },
     encoding: 'utf8',
   });
   if (result.status !== 0) {
@@ -150,20 +156,50 @@ print(json.dumps({
   assert.match(data.status_after, /Ponytail mode: ultra/);
 });
 
-test('Hermes plugin review mode injects the real review skill body', () => {
-  const output = python(String.raw`
+test('Hermes honors plain and BOM-prefixed default-mode config before LLM calls', (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-config-'));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(tmp, 'ponytail'));
+  for (const prefix of ['', '\uFEFF']) {
+    for (const mode of ['lite', 'off']) {
+      fs.writeFileSync(path.join(tmp, 'ponytail', 'config.json'), prefix + JSON.stringify({ defaultMode: mode }));
+      const output = python(String.raw`
 import importlib.util, json
 spec = importlib.util.spec_from_file_location('ponytail_hermes_plugin', '__init__.py')
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-ctx = mod.build_injected_context('review')
-print(json.dumps({'ctx': ctx}))
-`);
-  const { ctx } = JSON.parse(output);
-  assert.match(ctx, /PONYTAIL MODE ACTIVE — level: review/);
-  assert.match(ctx, /Review diffs for unnecessary complexity/);
-  assert.match(ctx, /net: -<N> lines possible/);
-  assert.doesNotMatch(ctx, /^---/);
+print(json.dumps(mod._pre_llm_call()))
+`, { XDG_CONFIG_HOME: tmp, PONYTAIL_DEFAULT_MODE: '' });
+      const data = JSON.parse(output);
+      if (mode === 'off') assert.equal(data, null);
+      else assert.match(data.context, /PONYTAIL MODE ACTIVE — level: lite/);
+    }
+  }
+});
+
+test('Hermes treats review as a command, never a level', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ponytail-review-default-'));
+  fs.mkdirSync(path.join(tmp, 'ponytail'), { recursive: true });
+  fs.writeFileSync(path.join(tmp, 'ponytail', 'config.json'), JSON.stringify({ defaultMode: 'review' }));
+  const output = python(String.raw`
+import importlib.util, json, os
+spec = importlib.util.spec_from_file_location('ponytail_hermes_plugin', '__init__.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+env_default = mod.build_injected_context(None)
+del os.environ['PONYTAIL_DEFAULT_MODE']
+file_default = mod.build_injected_context(None)
+explicit_review = mod.build_injected_context('review')
+print(json.dumps({
+    'env_default': env_default,
+    'file_default': file_default,
+    'explicit_review': explicit_review,
+}))
+`, { XDG_CONFIG_HOME: tmp, PONYTAIL_DEFAULT_MODE: 'review' });
+  const data = JSON.parse(output);
+  assert.match(data.env_default, /PONYTAIL MODE ACTIVE — level: full/);
+  assert.match(data.file_default, /PONYTAIL MODE ACTIVE — level: full/);
+  assert.match(data.explicit_review, /PONYTAIL MODE ACTIVE — level: full/);
 });
 
 test('Hermes /ponytail command changes mode and pre_llm_call injects current context', () => {
@@ -219,6 +255,40 @@ print(json.dumps({'first': first, 'second': second, 'switched': switched, 'after
   assert.equal(data.second, null);
   assert.match(data.switched.context, /PONYTAIL MODE ACTIVE — level: ultra/);
   assert.equal(data.after_switch, null);
+});
+
+test('Hermes /ponytail off reaches the model once, and a later level re-injects the ruleset', () => {
+  // The ruleset from the first turn is replayed from api_content on every later
+  // turn, and the command's reply goes to the user only, so off must be injected.
+  const output = python(String.raw`
+import importlib.util, json
+spec = importlib.util.spec_from_file_location('ponytail_hermes_plugin', '__init__.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+first = mod._pre_llm_call(conversation_history=[])
+history = [{
+    'role': 'user',
+    'content': 'first task',
+    'api_content': 'first task\\n\\n' + first['context'],
+}]
+mod._handle_mode_command('off')
+nothing_persisted = mod._pre_llm_call(conversation_history=[])
+off = mod._pre_llm_call(conversation_history=history)
+history.append({
+    'role': 'user',
+    'content': 'second task',
+    'api_content': 'second task\\n\\nPONYTAIL MODE OFF',
+})
+still_off = mod._pre_llm_call(conversation_history=history)
+mod._handle_mode_command('full')
+back_on = mod._pre_llm_call(conversation_history=history)
+print(json.dumps({'nothing_persisted': nothing_persisted, 'off': off, 'still_off': still_off, 'back_on': back_on}))
+`);
+  const data = JSON.parse(output);
+  assert.equal(data.nothing_persisted, null);
+  assert.deepEqual(data.off, { context: 'PONYTAIL MODE OFF' });
+  assert.equal(data.still_off, null);
+  assert.match(data.back_on.context, /PONYTAIL MODE ACTIVE — level: full/);
 });
 
 test('Hermes gateway rewrite respects slash access denial', () => {
